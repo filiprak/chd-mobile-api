@@ -158,9 +158,11 @@ class Activities_Route extends WP_REST_Controller {
     {
         $activity_id = bp_activity_post_update(array(
             'content' => $request['content'],
+            'user_id' => wp_get_current_user()->ID,
+            'error_type' => 'bool',
         ));
 
-        if ($activity_id !== false) {
+        if (is_numeric($activity_id)) {
             $result = bp_activity_get(array(
                 'in' => array($activity_id)
             ));
@@ -170,16 +172,14 @@ class Activities_Route extends WP_REST_Controller {
             if ($bp_activity) {
                 $avatar = bp_core_fetch_avatar(array('item_id' => $bp_activity->user_id, 'html' => false));
                 $bp_activity->avatar = chd_normalize_url($avatar);
+
+                return new WP_REST_Response($bp_activity, 200);
+            } else {
+                return new WP_Error(500, 'Internal server error');
             }
 
-            $response = $bp_activity ? $bp_activity : array(
-                'id' => $activity_id
-            );
-
-            return new WP_REST_Response($response, 200);
-
         } else {
-            return new WP_Error(400, 'Failed to post update');
+            return new WP_Error(400, 'Failed to create new post');
         }
     }
 

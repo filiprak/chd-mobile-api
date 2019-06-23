@@ -17,61 +17,75 @@ class Messages_Route extends WP_REST_Controller {
                 'callback'            => array( $this, 'get_items' ),
                 'permission_callback' => array( $this, 'get_items_permissions_check' ),
                 'args'                => array(
-                    'page' => array(
-                        'default' => 1,
+                    'offset' => array(
+                        'default' => 0,
                         'validate_callback' => function ($value, $request, $param) {
-                            return is_numeric( $value ) && $value > 0;
+                            return is_numeric( $value ) && $value >= 0;
                         }
                     ),
-                    'per_page' => array(
+                    'limit' => array(
                         'default' => 20,
                         'validate_callback' => function ($value, $request, $param) {
-                            return is_numeric( $value ) && $value > 0;
+                            return is_numeric( $value ) && $value >= 0;
                         },
                         'sanitize_callback' => function ($value, $request, $param) {
                             return min(50, $value);
                         }
                     ),
-                    'with_avatar' => array(
-                        'default' => false,
+                    'thread_id' => array(
+                        'default' => -1,
                         'validate_callback' => function ($value, $request, $param) {
-                            return $value == '' || $value === 'true' || $value === 'false';
+                            return is_numeric( $value ) && $value > 0;
                         },
-                        'sanitize_callback' => function ($value, $request, $param) {
-                            return $value === 'true' ? true : false;
-                        }
                     )
                 ),
             ),
+        ));
+        register_rest_route( CHD_MOBILE_API_REST_NAMESPACE, '/' . $this->base, array(
             array(
                 'methods'             => 'POST',
                 'callback'            => array( $this, 'create_item' ),
                 'permission_callback' => array( $this, 'create_item_permissions_check' ),
                 'args'                => array(
+                    'subject' => array(
+                        'default' => 'Wiadomość wysłana z aplikacji mobilnej',
+                        'validate_callback' => function ($value, $request, $param) {
+                            return is_string($value) && strlen($value) > 0;
+                        }
+                    ),
                     'content' => array(
                         'default' => '',
                         'validate_callback' => function ($value, $request, $param) {
                             return is_string($value) && strlen($value) > 0;
                         }
                     ),
-                ),
-            ),
-        ) );
-        register_rest_route( CHD_MOBILE_API_REST_NAMESPACE, '/' . $this->base . '/(?P<id>\d+)', array(
-            array(
-                'methods'             => 'GET',
-                'callback'            => array( $this, 'get_item' ),
-                'permission_callback' => array( $this, 'get_item_permissions_check' ),
-                'args'                => array(
-                    'id' => array(
-                        'default' => null,
+                    'thread_id' => array(
+                        'default' => 'new',
                         'validate_callback' => function ($value, $request, $param) {
-                            return is_numeric($value) && $value > 0;
+                            return $value === 'new' || (is_numeric($value) && $value > 0);
+                        }
+                    ),
+                    'recipients' => array(
+                        'default' => array(),
+                        'validate_callback' => function ($value, $request, $param) {
+                            if (is_array($value) && count($value) > 0 && count($value) < 51) {
+                                foreach ($value as $item) {
+                                    if (!is_numeric($item)) {
+                                        return false;
+                                    } else if ($item < 1) {
+                                        return false;
+                                    }
+                                }
+                                return true;
+                            } else {
+                                error_log($request['thread_id']);
+                                return $request['thread_id'] !== 'new';
+                            }
                         }
                     ),
                 ),
             ),
-        ));
+        ) );
     }
 
     /**
@@ -82,27 +96,44 @@ class Messages_Route extends WP_REST_Controller {
      */
     public function get_items( $request ) {
 
-        $bp_data = bp_activity_get( array(
-            'display_comments'  => false,
-            'count_total'       => false,
-            'per_page'          => $request['per_page'],
-            'page'              => $request['page'],
-            'sort'              => 'DESC',
-        ) );
+        global $wpdb;
 
-        if ($request['with_avatar']) {
-            foreach ($bp_data['activities'] as $bp_activity) {
-                $avatar_url = bp_core_fetch_avatar(array('item_id' => $bp_activity->user_id, 'html' => false));
-                $bp_activity->avatar = chd_normalize_url($avatar_url);
+        $user = wp_get_current_user();
+
+        $messages = $wpdb->get_results("
+            SELECT *
+            FROM    {$wpdb->prefix}bp_messages_messages
+            WHERE   thread_id = {$request['thread_id']}
+            ORDER BY date_sent DESC
+            LIMIT {$request['offset']}, {$request['limit']}
+        ");
+
+        $total = $wpdb->get_row("
+            SELECT COUNT(*) as c
+            FROM    {$wpdb->prefix}bp_messages_messages
+            WHERE   thread_id = {$request['thread_id']}
+        ");
+
+        foreach ($messages as $item) {
+            $item->id = (int) $item->id;
+            $item->thread_id = (int) $item->thread_id;
+            $item->sender_id = (int) $item->sender_id;
+            $item->subject = (string) stripslashes(wp_specialchars_decode($item->subject));
+            $item->message = (string) stripslashes(wp_specialchars_decode($item->message));
+
+            if ($item->sender_id == $user->ID) {
+                $item->self = true;
             }
         }
 
-        $response = array(
-            'items' => $bp_data['activities'],
-            'has_more_items' => (bool) $bp_data['has_more_items'],
-        );
 
-        return new WP_REST_Response($response, 200 );
+        return new WP_REST_Response(array(
+            'offset' => (int) $request['offset'],
+            'limit' => (int) $request['limit'],
+            'count' => count($messages),
+            'total' => (int) $total->c,
+            'items' => $messages,
+        ), 200 );
     }
 
     /**
@@ -112,7 +143,24 @@ class Messages_Route extends WP_REST_Controller {
      * @return WP_Error|bool
      */
     public function get_items_permissions_check( $request ) {
-        return is_user_logged_in();
+
+        global $wpdb;
+
+        if (is_user_logged_in()) {
+            $thread_id = (int) $request['thread_id'];
+            $user = wp_get_current_user();
+
+            $user_threads = $wpdb->get_results("
+                SELECT  thread_id
+                FROM    {$wpdb->prefix}bp_messages_recipients
+                WHERE   thread_id = {$thread_id}
+                AND     user_id = {$user->ID}
+            ");
+
+            return count($user_threads) > 0;
+        }
+
+        return false;
     }
 
     /**
@@ -150,47 +198,64 @@ class Messages_Route extends WP_REST_Controller {
     }
 
     /**
-     * Create new activity
+     * Create new message
      * @param WP_REST_Request $request
      * @return WP_Error|WP_REST_Response
      */
     public function create_item($request)
     {
-        $activity_id = bp_activity_post_update(array(
+        $user = wp_get_current_user();
+
+        $args = array(
+            'sender_id' => $user->ID,
+            'subject' => $request['subject'],
             'content' => $request['content'],
-        ));
+            'error_type' => 'wp_error',
+        );
 
-        if ($activity_id !== false) {
-            $result = bp_activity_get(array(
-                'in' => array($activity_id)
-            ));
-
-            $bp_activity = isset($result['activities'][0]) ? $result['activities'][0] : null;
-
-            if ($bp_activity) {
-                $avatar = bp_core_fetch_avatar(array('item_id' => $bp_activity->user_id, 'html' => false));
-                $bp_activity->avatar = chd_normalize_url($avatar);
-            }
-
-            $response = $bp_activity ? $bp_activity : array(
-                'id' => $activity_id
-            );
-
-            return new WP_REST_Response($response, 200);
-
+        if ($request['thread_id'] === 'new') {
+            $args['recipients'] = $request['recipients'];
         } else {
-            return new WP_Error(400, 'Failed to post update');
+            $args['thread_id'] = $request['thread_id'];
+        }
+
+        $result = messages_new_message($args);
+
+        if ($result === false) {
+            return new WP_Error(500, 'Failed to create message');
+        } else if (is_wp_error($result)) {
+            return $result;
+        } else {
+            return new WP_REST_Response(array(
+                'thread_id' => $result,
+            ), 200);
         }
     }
 
     /**
-     * Create new activity check
+     * Create new message check
      * @param WP_REST_Request $request
      * @return bool|WP_Error
      */
     public function create_item_permissions_check($request)
     {
-        return is_user_logged_in();
+        global $wpdb;
+
+        if (is_user_logged_in()) {
+            if (is_numeric($request['thread_id'])) {
+                $user = wp_get_current_user();
+                $user_threads = $wpdb->get_results("
+                    SELECT  thread_id
+                    FROM    {$wpdb->prefix}bp_messages_recipients
+                    WHERE   thread_id = {$request['thread_id']}
+                    AND     user_id = {$user->ID}
+                ");
+                return count($user_threads) > 0;
+            } else {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

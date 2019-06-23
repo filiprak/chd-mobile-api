@@ -17,16 +17,16 @@ class Threads_Route extends WP_REST_Controller {
                 'callback'            => array( $this, 'get_items' ),
                 'permission_callback' => array( $this, 'get_items_permissions_check' ),
                 'args'                => array(
-                    'page' => array(
-                        'default' => 1,
+                    'offset' => array(
+                        'default' => 0,
                         'validate_callback' => function ($value, $request, $param) {
-                            return is_numeric( $value ) && $value > 0;
+                            return is_numeric( $value ) && $value >= 0;
                         }
                     ),
-                    'per_page' => array(
+                    'limit' => array(
                         'default' => 10,
                         'validate_callback' => function ($value, $request, $param) {
-                            return is_numeric( $value ) && $value > 0;
+                            return is_numeric( $value ) && $value >= 0;
                         },
                         'sanitize_callback' => function ($value, $request, $param) {
                             return min(50, $value);
@@ -58,8 +58,6 @@ class Threads_Route extends WP_REST_Controller {
 
         $user = wp_get_current_user();
 
-        $offset = ($request['page'] - 1) * $request['per_page'];
-
         $threads = $wpdb->get_results("
             SELECT *, (
                 SELECT    m.id
@@ -71,7 +69,7 @@ class Threads_Route extends WP_REST_Controller {
             WHERE   user_id = {$user->ID}
             " . ($request['exclude_deleted'] ? " AND is_deleted = 0 " : " ") . "
             ORDER BY last_message_id DESC
-            LIMIT {$offset}, {$request['per_page']}
+            LIMIT {$request['offset']}, {$request['limit']}
         ");
 
         $last_messages_dict = array();
@@ -92,6 +90,9 @@ class Threads_Route extends WP_REST_Controller {
             foreach ($last_messages as $msg) {
                 $msg->id = (int) $msg->id;
                 $msg->sender_id = (int) $msg->sender_id;
+                $msg->self = $user->ID == $msg->sender_id;
+                $msg->subject = (string) stripslashes(wp_specialchars_decode($msg->subject));
+                $msg->message = (string) stripslashes(wp_specialchars_decode($msg->message));
                 $last_messages_dict[$msg->id] = $msg;
             }
 
@@ -118,14 +119,21 @@ class Threads_Route extends WP_REST_Controller {
                 $avatar_url = bp_core_fetch_avatar(array('item_id' => $recipient->user_id, 'html' => false));
                 $recipient->avatar = chd_normalize_url($avatar_url);
 
-                $recipients_dict[$recipient->thread_id] = $recipient;
+                if (!$recipient->user_login) {
+                    $recipient->user_name = '[Usunięty użytkownik]';
+                    $recipient->user_nicename = 'deleted-' . $recipient->user_id;
+                    $recipient->user_login = 'deleted-' . $recipient->user_id;
+                    $recipient->display_name = '[Usunięty użytkownik]';
+                }
+
+                $recipients_dict[$recipient->thread_id][] = $recipient;
                 unset($recipient->thread_id);
             }
         }
 
         foreach ($threads as $thread) {
             $thread->last_message = $last_messages_dict[$thread->last_message_id];
-            $thread->recipient = $recipients_dict[$thread->thread_id];
+            $thread->recipients = $recipients_dict[$thread->thread_id];
 
             $thread->self_recipient_id = (int) $thread->id;
             $thread->user_id = (int) $thread->user_id;
@@ -139,10 +147,18 @@ class Threads_Route extends WP_REST_Controller {
             unset($thread->thread_id);
         }
 
+        $total = $wpdb->get_row("
+            SELECT COUNT(*) as c
+            FROM    {$wpdb->prefix}bp_messages_recipients
+            WHERE   user_id = {$user->ID}
+            " . ($request['exclude_deleted'] ? " AND is_deleted = 0 " : " ") . "
+        ");
+
         $response = array(
-            'page' => (int) $request['page'],
-            'per_page' => (int) $request['per_page'],
+            'offset' => (int) $request['offset'],
+            'limit' => (int) $request['limit'],
             'count' => count($threads),
+            'total' => (int) $total->c,
             'items' => $threads,
         );
 
